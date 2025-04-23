@@ -12,15 +12,14 @@ export const getDatabaseConfig = async (
 ): Promise<TypeOrmModuleOptions> => ({
   type: "postgres",
   name: "default",
-  host: configService.get<string>("DB_HOST"),
-  port: configService.get<number>("DB_PORT"),
-  username: configService.get<string>("DB_USERNAME"),
-  password: configService.get<string>("DB_PASSWORD"),
-  database: configService.get<string>("DB_DATABASE"),
+  host: configService.get<string>("DB_HOST") || "localhost",
+  port: configService.get<number>("DB_PORT") || 5433,
+  username: configService.get<string>("DB_USERNAME") || "postgres",
+  password: configService.get<string>("DB_PASSWORD") || "password",
+  database: configService.get<string>("DB_DATABASE") || "chronoflow",
   entities: [User, Device, DeviceAuth, QRCodeAuth],
-  synchronize: configService.get<string>("NODE_ENV") === "development",
-  logging: configService.get<string>("NODE_ENV") === "development",
-  // Disable migrations for now
+  synchronize: true,
+  logging: true,
   migrations: [],
   migrationsRun: false,
 });

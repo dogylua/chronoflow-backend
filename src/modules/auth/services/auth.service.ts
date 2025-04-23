@@ -7,20 +7,19 @@ import {
 } from "@nestjs/common";
 import { InjectRepository } from "@nestjs/typeorm";
 import { Repository } from "typeorm";
-import {
-  Device,
-  DeviceInfo,
-  LocationInfo,
-  CreateDeviceDTO,
-  CreateQRCodeAuthDTO,
-} from "../models/device.model";
-import { DeviceAuth } from "../models/device.model";
-import { QRCodeAuth } from "../models/device.model";
+import { Device, DeviceAuth, QRCodeAuth } from "../models/device.model";
 import { User } from "../../users/models/user.model";
 import { JwtService } from "@nestjs/jwt";
 import { ConfigService } from "@nestjs/config";
 import { v4 as uuidv4 } from "uuid";
 import { AppError } from "../../../core/error/app-error";
+import { RegisterDto } from "../dto/register.dto";
+import { LoginDto } from "../dto/login.dto";
+import { RegisterDeviceDto } from "../dto/register-device.dto";
+import { QrAuthDto } from "../dto/qr-auth.dto";
+import { AuthResponseDto } from "../dto/auth-response.dto";
+import { DeviceAuthResponseDto } from "../dto/device-auth-response.dto";
+import { DeviceType } from "../models/device.model";
 
 @Injectable()
 export class AuthService {
@@ -39,92 +38,92 @@ export class AuthService {
     private readonly configService: ConfigService
   ) {}
 
-  async checkDeviceRegistration(
-    deviceInfo: DeviceInfo
-  ): Promise<{ isRegistered: boolean; deviceId?: string }> {
+  async register(registerDto: RegisterDto): Promise<AuthResponseDto> {
     try {
-      if (!deviceInfo?.identifierForVendor) {
-        throw new BadRequestException("Invalid device information");
-      }
-
-      const device = await this.deviceRepository.findOne({
-        where: {
-          deviceInfo: {
-            identifierForVendor: deviceInfo.identifierForVendor,
-          },
-        },
-        relations: ["user"],
+      const existingUser = await this.userRepository.findOne({
+        where: { email: registerDto.email },
       });
 
-      if (device) {
-        this.logger.log(`Updating device information for device ${device.id}`);
-        await this.deviceRepository.update(device.id, {
-          deviceInfo,
-          lastActiveAt: new Date(),
-        });
+      if (existingUser) {
+        throw new ConflictException("Email already registered");
       }
 
-      return {
-        isRegistered: !!device,
-        deviceId: device?.id,
-      };
+      const user = await this.userRepository.save({
+        email: registerDto.email,
+        passwordHash: await this.hashPassword(registerDto.password),
+        firstName: registerDto.firstName,
+        lastName: registerDto.lastName,
+        role: "user",
+        isVerified: true,
+      });
+
+      return this.generateAuthResponse(user);
     } catch (error) {
       this.logger.error(
-        `Error checking device registration: ${error.message}`,
+        `Error registering user: ${error.message}`,
         error.stack
       );
       if (error instanceof AppError) {
         throw error;
       }
-      throw new AppError("Failed to check device registration", 500);
+      throw new AppError("Failed to register user", 500);
+    }
+  }
+
+  async login(loginDto: LoginDto): Promise<AuthResponseDto> {
+    try {
+      const user = await this.userRepository.findOne({
+        where: { email: loginDto.email },
+      });
+
+      if (!user) {
+        throw new NotFoundException("User not found");
+      }
+
+      const isPasswordValid = await this.verifyPassword(
+        loginDto.password,
+        user.passwordHash
+      );
+
+      if (!isPasswordValid) {
+        throw new BadRequestException("Invalid credentials");
+      }
+
+      return this.generateAuthResponse(user);
+    } catch (error) {
+      this.logger.error(`Error logging in user: ${error.message}`, error.stack);
+      if (error instanceof AppError) {
+        throw error;
+      }
+      throw new AppError("Failed to login user", 500);
     }
   }
 
   async registerDevice(
-    deviceInfo: DeviceInfo,
-    locationInfo: LocationInfo
-  ): Promise<{ accessToken: string; refreshToken: string }> {
+    registerDeviceDto: RegisterDeviceDto
+  ): Promise<DeviceAuthResponseDto> {
     try {
-      if (!deviceInfo?.identifierForVendor) {
-        throw new BadRequestException("Invalid device information");
-      }
-
-      const { isRegistered, deviceId } =
-        await this.checkDeviceRegistration(deviceInfo);
-
-      if (isRegistered && deviceId) {
-        this.logger.log(
-          `Device ${deviceId} already registered, generating new tokens`
-        );
-        const device = await this.deviceRepository.findOne({
-          where: { id: deviceId },
-          relations: ["user"],
-        });
-
-        if (!device || !device.user) {
-          throw new NotFoundException("Device or user not found");
-        }
-
-        return this.generateTokens(device.id, device.user.id);
-      }
-
-      this.logger.log("Creating new device registration");
-      const userEmail = `device_${Date.now()}_${Math.random().toString(36).substr(2, 9)}@chronoflow.app`;
-      const user = await this.userRepository.save({
-        email: userEmail,
-        passwordHash: "",
-        role: "user",
-        isVerified: true,
-      });
-
       const device = await this.deviceRepository.save({
-        userId: user.id,
-        deviceInfo,
-        locationInfo,
-        isPrimary: true,
+        deviceId: registerDeviceDto.deviceId,
+        deviceName: registerDeviceDto.deviceName,
+        deviceType: registerDeviceDto.deviceType || DeviceType.MOBILE,
+        os: registerDeviceDto.os,
+        model: registerDeviceDto.model,
+        userId: registerDeviceDto.userId,
+        isPrimary: !registerDeviceDto.userId,
       });
 
-      return this.generateTokens(device.id, user.id);
+      const deviceToken = await this.generateDeviceToken(device.id);
+
+      return {
+        deviceToken,
+        device: {
+          id: device.id,
+          name: device.deviceName,
+          type: device.deviceType,
+        },
+        status: registerDeviceDto.userId ? "authenticated" : "pending",
+      };
     } catch (error) {
       this.logger.error(
         `Error registering device: ${error.message}`,
@@ -137,7 +136,10 @@ export class AuthService {
     }
   }
 
-  async generateQRCode(userId: string, deviceId: string): Promise<string> {
+  async generateQRCode(
+    userId: string,
+    deviceId: string
+  ): Promise<DeviceAuthResponseDto> {
     try {
       const code = uuidv4();
       const expiresAt = new Date();
@@ -151,10 +153,20 @@ export class AuthService {
         isUsed: false,
       });
 
-      this.logger.log(
-        `Generated QR code for user ${userId} and device ${deviceId}`
-      );
-      return code;
+      const device = await this.deviceRepository.findOne({
+        where: { id: deviceId },
+      });
+
+      return {
+        deviceToken: code,
+        qrCode: code,
+        device: {
+          id: device.id,
+          name: device.deviceName,
+          type: device.deviceType,
+        },
+        status: "pending",
+      };
     } catch (error) {
       this.logger.error(
         `Error generating QR code: ${error.message}`,
@@ -167,14 +179,10 @@ export class AuthService {
     }
   }
 
-  async authenticateWithQRCode(
-    code: string,
-    deviceInfo: DeviceInfo,
-    locationInfo: LocationInfo
-  ): Promise<{ accessToken: string; refreshToken: string }> {
+  async authenticateWithQRCode(qrAuthDto: QrAuthDto): Promise<AuthResponseDto> {
     try {
       const qrCodeAuth = await this.qrCodeAuthRepository.findOne({
-        where: { code, isUsed: false },
+        where: { code: qrAuthDto.qrToken, isUsed: false },
         relations: ["user"],
       });
 
@@ -183,16 +191,14 @@ export class AuthService {
       }
 
       const device = await this.deviceRepository.save({
-        userId: qrCodeAuth.userId,
-        deviceInfo,
-        locationInfo,
+        userId: qrAuthDto.userId,
+        deviceId: qrAuthDto.deviceId,
         isPrimary: false,
       });
 
       await this.qrCodeAuthRepository.update(qrCodeAuth.id, { isUsed: true });
-      this.logger.log(`Device ${device.id} authenticated with QR code`);
 
-      return this.generateTokens(device.id, qrCodeAuth.userId);
+      return this.generateAuthResponse(qrCodeAuth.user);
     } catch (error) {
       this.logger.error(
         `Error authenticating with QR code: ${error.message}`,
@@ -205,21 +211,18 @@ export class AuthService {
     }
   }
 
-  async refreshToken(
-    refreshToken: string
-  ): Promise<{ accessToken: string; refreshToken: string }> {
+  async refreshToken(refreshToken: string): Promise<AuthResponseDto> {
     try {
       const deviceAuth = await this.deviceAuthRepository.findOne({
         where: { refreshToken },
-        relations: ["device"],
+        relations: ["device", "device.user"],
       });
 
       if (!deviceAuth || deviceAuth.expiresAt < new Date()) {
         throw new BadRequestException("Invalid or expired refresh token");
       }
 
-      this.logger.log(`Refreshing tokens for device ${deviceAuth.deviceId}`);
-      return this.generateTokens(deviceAuth.deviceId, deviceAuth.device.userId);
+      return this.generateAuthResponse(deviceAuth.device.user);
     } catch (error) {
       this.logger.error(
         `Error refreshing token: ${error.message}`,
@@ -232,44 +235,93 @@ export class AuthService {
     }
   }
 
-  private async generateTokens(
-    deviceId: string,
-    userId: string
-  ): Promise<{ accessToken: string; refreshToken: string }> {
+  async checkDevice(deviceId: string): Promise<DeviceAuthResponseDto> {
     try {
-      const [accessToken, refreshToken] = await Promise.all([
-        this.jwtService.signAsync(
-          { deviceId, userId },
-          {
-            secret: this.configService.get<string>("JWT_SECRET"),
-            expiresIn: "15m",
-          }
-        ),
-        this.jwtService.signAsync(
-          { deviceId, userId },
-          {
-            secret: this.configService.get<string>("JWT_REFRESH_SECRET"),
-            expiresIn: "7d",
-          }
-        ),
-      ]);
-
-      await this.deviceAuthRepository.save({
-        deviceId,
-        refreshToken,
-        expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      const device = await this.deviceRepository.findOne({
+        where: { deviceId },
       });
 
-      return { accessToken, refreshToken };
+      if (!device) {
+        return {
+          deviceToken: null,
+          device: null,
+          status: "pending",
+        };
+      }
+
+      const deviceToken = await this.generateDeviceToken(device.id);
+
+      return {
+        deviceToken,
+        device: {
+          id: device.id,
+          name: device.deviceName,
+          type: device.deviceType,
+        },
+        status: device.userId ? "authenticated" : "pending",
+      };
     } catch (error) {
-      this.logger.error(
-        `Error generating tokens: ${error.message}`,
-        error.stack
-      );
+      this.logger.error(`Error checking device: ${error.message}`, error.stack);
       if (error instanceof AppError) {
         throw error;
       }
-      throw new AppError("Failed to generate tokens", 500);
+      throw new AppError("Failed to check device", 500);
     }
+  }
+
+  private async generateAuthResponse(user: User): Promise<AuthResponseDto> {
+    const [accessToken, refreshToken] = await Promise.all([
+      this.jwtService.signAsync(
+        { userId: user.id },
+        {
+          secret: this.configService.get<string>("JWT_SECRET"),
+          expiresIn: this.configService.get<string>("JWT_ACCESS_EXPIRATION"),
+        }
+      ),
+      this.jwtService.signAsync(
+        { userId: user.id },
+        {
+          secret: this.configService.get<string>("JWT_REFRESH_SECRET"),
+          expiresIn: this.configService.get<string>("JWT_REFRESH_EXPIRATION"),
+        }
+      ),
+    ]);
+
+    return {
+      accessToken,
+      tokenType: "Bearer",
+      expiresIn: parseInt(
+        this.configService.get<string>("JWT_ACCESS_EXPIRATION")
+      ),
+      user: {
+        id: user.id,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
+      },
+    };
+  }
+
+  private async generateDeviceToken(deviceId: string): Promise<string> {
+    return this.jwtService.signAsync(
+      { deviceId },
+      {
+        secret: this.configService.get<string>("JWT_DEVICE_SECRET"),
+        expiresIn: this.configService.get<string>("JWT_DEVICE_EXPIRATION"),
+      }
+    );
+  }
+
+  private async hashPassword(password: string): Promise<string> {
+    // Implement password hashing (e.g., using bcrypt)
+    return password; // Replace with actual hashing
+  }
+
+  private async verifyPassword(
+    password: string,
+    hash: string
+  ): Promise<boolean> {
+    // Implement password verification (e.g., using bcrypt)
+    return password === hash; // Replace with actual verification
   }
 }

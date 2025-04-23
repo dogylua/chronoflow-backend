@@ -13,9 +13,17 @@ async function bootstrap() {
   const configService = app.get(ConfigService);
 
   // Security
-  app.use(helmet());
+  app.use(
+    helmet({
+      contentSecurityPolicy: false,
+    })
+  );
   app.use(compression());
-  app.enableCors();
+  app.enableCors({
+    origin: true,
+    methods: "GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS",
+    credentials: true,
+  });
 
   // Validation and Error Handling
   app.useGlobalPipes(
@@ -34,16 +42,23 @@ async function bootstrap() {
     .setDescription("The ChronoFlow API description")
     .setVersion("1.0")
     .addBearerAuth()
+    .addServer("http://localhost:8080")
     .build();
+
   const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup("docs", app, document);
+  SwaggerModule.setup("swagger", app, document, {
+    swaggerOptions: {
+      persistAuthorization: true,
+    },
+    customSiteTitle: "ChronoFlow API Documentation",
+  });
 
   // Start the application
   const port = configService.get<number>("PORT") || 8080;
   await app.listen(port);
   console.log(`
 🚀 Application is running on: http://localhost:${port}
-📝 API Documentation: http://localhost:${port}/docs
+📝 API Documentation: http://localhost:${port}/swagger
   `);
 }
 
